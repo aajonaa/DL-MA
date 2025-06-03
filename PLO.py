@@ -8,7 +8,15 @@ import torch.nn as nn
 import torch.optim as optim
 
 from torch.utils.data import Dataset, DataLoader
-from torch.utils.tensorboard import SummaryWriter
+
+# Optional TensorBoard import
+try:
+    from torch.utils.tensorboard import SummaryWriter
+    TENSORBOARD_AVAILABLE = True
+except ImportError:
+    print("Warning: TensorBoard not available. Logging will be disabled.")
+    SummaryWriter = None
+    TENSORBOARD_AVAILABLE = False
 
 from collections import deque
 
@@ -385,15 +393,23 @@ class DirPLO(OriginalPLO):
 
     def __init__(self, epoch, pop_size,
                  prediction_usage_probability=0.5,
-                 min_data_for_training=1000,
-                 augmentation_factor=100,
-                 max_augmented_samples=100000,
+                 min_data_for_training=100,  # Much lower for small problems
+                 augmentation_factor=50,  # Reduced from 100
+                 max_augmented_samples=50000,  # Reduced from 100000
                  noise_std_ratio=0.1,
-                 train_every=10,
-                 n_grad_epochs=5,
-                 batch_size=4096,
-                 hidden_nodes=64,
-                 learning_rate=2e-3,
+                 train_every=10,  # Back to more frequent training
+                 n_grad_epochs=3,  # Reduced from 5 (fewer training epochs)
+                 batch_size=4096,  # Reasonable batch size
+                 hidden_nodes=32,  # Reduced network size
+                 learning_rate=5e-3,  # Increased learning rate for faster convergence
+                 # Enhanced magnitude adjustment parameters
+                 magnitude_strategy='adaptive_multi',  # 'simple', 'de_style', 'pso_style', 'adaptive_multi'
+                 base_f_factor=0.5,
+                 f_factor_range=(0.2, 0.8),
+                 crossover_rate=0.7,
+                 use_population_guidance=True,
+                 diversity_threshold=0.1,
+                 fast_mode=False,  # Enable for maximum speed
                  **kwargs):
         super().__init__(epoch, pop_size, **kwargs)
 
@@ -408,6 +424,23 @@ class DirPLO(OriginalPLO):
         self.batch_size = batch_size
         self.hidden_nodes = hidden_nodes
         self.learning_rate = learning_rate
+
+        # Enhanced magnitude adjustment parameters
+        self.magnitude_strategy = magnitude_strategy
+        self.base_f_factor = base_f_factor
+        self.f_factor_range = f_factor_range
+        self.crossover_rate = crossover_rate
+        self.use_population_guidance = use_population_guidance
+        self.diversity_threshold = diversity_threshold
+
+        # Fast mode adjustments
+        if fast_mode:
+            self.min_data_for_training = 50  # Even lower threshold
+            self.train_every = max(30, self.train_every * 2)  # Train less frequently
+            self.n_grad_epochs = max(1, self.n_grad_epochs // 2)  # Fewer epochs
+            self.max_augmented_samples = min(5000, self.max_augmented_samples // 10)  # Much less augmentation
+            self.augmentation_factor = max(5, self.augmentation_factor // 10)  # Much less augmentation
+            self.early_stopping_patience = 1  # More aggressive early stopping
 
         # Neural network components
         self.dirnet = None
@@ -428,6 +461,12 @@ class DirPLO(OriginalPLO):
         # Training session tracking for TensorBoard
         self.training_session_count = 0
         self.global_step_counter = 0
+
+        # Performance optimization parameters
+        self.early_stopping_patience = 3  # Stop training if no improvement
+        self.min_loss_improvement = 1e-5  # Minimum improvement threshold
+        self.last_training_loss = float('inf')
+        self.no_improvement_count = 0
 
     def _calculate_noise_std(self):
         """Calculate noise standard deviation based on problem bounds"""
@@ -493,6 +532,189 @@ class DirPLO(OriginalPLO):
         cosine_loss = DirPLO.cosine_loss(pred, tgt)
         mse_loss = DirPLO.mse_loss(pred, tgt)
         return alpha * cosine_loss + (1 - alpha) * mse_loss
+
+    def _calculate_population_diversity(self):
+        """Calculate population diversity for adaptive magnitude scaling"""
+        if len(self.pop) < 2:
+            return 1.0
+
+        positions = np.array([agent.solution for agent in self.pop])
+        mean_pos = np.mean(positions, axis=0)
+        distances = [np.linalg.norm(pos - mean_pos) for pos in positions]
+        avg_distance = np.mean(distances)
+
+        # Normalize by problem bounds
+        bounds_range = np.linalg.norm(np.array(self.problem.ub) - np.array(self.problem.lb))
+        normalized_diversity = avg_distance / (bounds_range + 1e-12)
+
+        return normalized_diversity
+
+    def _get_adaptive_f_factor(self, epoch, diversity):
+        """Calculate adaptive F factor based on epoch progress and population diversity"""
+        progress_ratio = epoch / self.epoch
+
+        # Base F factor decreases over time
+        time_factor = self.base_f_factor * (1.0 - 0.5 * progress_ratio)
+
+        # Increase F when diversity is low (exploration needed)
+        diversity_factor = 1.0 + (1.0 - diversity) * 0.5
+
+        # Apply range constraints
+        f_factor = time_factor * diversity_factor
+        f_factor = np.clip(f_factor, self.f_factor_range[0], self.f_factor_range[1])
+
+        return f_factor
+
+    def _apply_de_style_magnitude(self, predicted_direction, current_solution, epoch, agent_idx):
+        """Apply DE-style magnitude scaling with multiple strategies"""
+        diversity = self._calculate_population_diversity()
+        f_factor = self._get_adaptive_f_factor(epoch, diversity)
+
+        # Choose DE strategy based on diversity and progress
+        progress_ratio = epoch / self.epoch
+        strategy_choice = self.generator.random()
+
+        if strategy_choice < 0.3:  # DE/rand/1 style
+            # Use predicted direction as primary difference vector
+            base_solution = current_solution
+            mutant = base_solution + f_factor * predicted_direction
+
+        elif strategy_choice < 0.6:  # DE/best/1 style
+            # Combine with direction toward best solution
+            best_agent = min(self.pop, key=lambda x: x.target.fitness if self.problem.minmax == "min"
+                           else lambda x: -x.target.fitness)
+            best_direction = best_agent.solution - current_solution
+
+            # Mix predicted direction with best direction
+            alpha = 0.7  # Weight for predicted direction
+            combined_direction = alpha * predicted_direction + (1 - alpha) * best_direction
+            mutant = current_solution + f_factor * combined_direction
+
+        else:  # DE/current-to-best/1 style
+            # Multi-vector approach
+            best_agent = min(self.pop, key=lambda x: x.target.fitness if self.problem.minmax == "min"
+                           else lambda x: -x.target.fitness)
+            best_direction = best_agent.solution - current_solution
+
+            # Use predicted direction as second difference vector
+            f1 = f_factor * 0.8  # Slightly reduce for stability
+            f2 = f_factor * 1.2
+
+            mutant = (current_solution +
+                     f1 * best_direction +
+                     f2 * predicted_direction)
+
+        return mutant
+
+    def _apply_pso_style_magnitude(self, predicted_direction, current_solution, epoch, agent_idx):
+        """Apply PSO-style magnitude scaling"""
+        diversity = self._calculate_population_diversity()
+
+        # PSO-style coefficients
+        w = 0.9 - 0.5 * (epoch / self.epoch)  # Inertia weight decreases over time
+        c1 = 2.0 * (1.0 + diversity)  # Cognitive component increases with diversity
+        c2 = 2.0 * (2.0 - diversity)  # Social component decreases with diversity
+
+        # Use predicted direction as "personal best" direction
+        # and direction toward population mean as "global best"
+        x_mean = np.mean([agent.solution for agent in self.pop], axis=0)
+        global_direction = x_mean - current_solution
+
+        # PSO-style velocity update using predicted direction
+        velocity = (w * predicted_direction +
+                   c1 * self.generator.random() * predicted_direction +
+                   c2 * self.generator.random() * global_direction)
+
+        # Scale velocity to reasonable magnitude
+        velocity_magnitude = np.linalg.norm(velocity)
+        bounds_range = np.linalg.norm(np.array(self.problem.ub) - np.array(self.problem.lb))
+        max_velocity = 0.1 * bounds_range
+
+        if velocity_magnitude > max_velocity:
+            velocity = velocity * (max_velocity / velocity_magnitude)
+
+        return current_solution + velocity
+
+    def _apply_abc_style_magnitude(self, predicted_direction, current_solution, epoch, agent_idx):
+        """Apply ABC-style magnitude scaling (single difference with random scaling)"""
+        # ABC-style random scaling factor
+        phi = self.generator.uniform(-1, 1)
+
+        # Adaptive scaling based on epoch progress
+        progress_ratio = epoch / self.epoch
+        scale_factor = 1.0 - 0.5 * progress_ratio  # Reduce exploration over time
+
+        # Apply ABC-style update: x_i + phi * (predicted_direction)
+        mutant = current_solution + phi * scale_factor * predicted_direction
+
+        return mutant
+
+    def _apply_crossover(self, mutant_solution, current_solution):
+        """Apply binomial crossover between mutant and current solution"""
+        trial_solution = current_solution.copy()
+
+        # Ensure at least one dimension is taken from mutant
+        j_rand = self.generator.integers(0, self.problem.n_dims)
+
+        for j in range(self.problem.n_dims):
+            if self.generator.random() < self.crossover_rate or j == j_rand:
+                trial_solution[j] = mutant_solution[j]
+
+        return trial_solution
+
+    def _apply_enhanced_magnitude_adjustment(self, predicted_direction, current_solution, epoch, agent_idx):
+        """
+        Enhanced magnitude adjustment using multiple population-based strategies.
+        Adaptively selects the best strategy based on population state and progress.
+        """
+        if predicted_direction is None:
+            return None
+
+        diversity = self._calculate_population_diversity()
+        progress_ratio = epoch / self.epoch
+
+        # Strategy selection based on population diversity and progress
+        if self.magnitude_strategy == 'simple':
+            # Original simple magnitude scaling
+            if not hasattr(self, 'base_magnitude'):
+                self.base_magnitude = 0.1 * np.linalg.norm(np.array(self.problem.ub) - np.array(self.problem.lb))
+            magnitude = self.base_magnitude * (0.95 ** epoch)
+            mutant = current_solution + magnitude * predicted_direction
+
+        elif self.magnitude_strategy == 'de_style':
+            mutant = self._apply_de_style_magnitude(predicted_direction, current_solution, epoch, agent_idx)
+
+        elif self.magnitude_strategy == 'pso_style':
+            mutant = self._apply_pso_style_magnitude(predicted_direction, current_solution, epoch, agent_idx)
+
+        elif self.magnitude_strategy == 'abc_style':
+            mutant = self._apply_abc_style_magnitude(predicted_direction, current_solution, epoch, agent_idx)
+
+        elif self.magnitude_strategy == 'adaptive_multi':
+            # Adaptive strategy selection based on population state
+            if diversity > self.diversity_threshold and progress_ratio < 0.5:
+                # High diversity, early stage: use DE-style for exploitation
+                mutant = self._apply_de_style_magnitude(predicted_direction, current_solution, epoch, agent_idx)
+            elif diversity <= self.diversity_threshold and progress_ratio < 0.7:
+                # Low diversity, mid stage: use PSO-style for balanced exploration
+                mutant = self._apply_pso_style_magnitude(predicted_direction, current_solution, epoch, agent_idx)
+            else:
+                # Late stage or very low diversity: use ABC-style for fine-tuning
+                mutant = self._apply_abc_style_magnitude(predicted_direction, current_solution, epoch, agent_idx)
+        else:
+            # Fallback to simple strategy
+            if not hasattr(self, 'base_magnitude'):
+                self.base_magnitude = 0.1 * np.linalg.norm(np.array(self.problem.ub) - np.array(self.problem.lb))
+            magnitude = self.base_magnitude * (0.95 ** epoch)
+            mutant = current_solution + magnitude * predicted_direction
+
+        # Apply crossover if enabled
+        if self.crossover_rate > 0:
+            trial_solution = self._apply_crossover(mutant, current_solution)
+        else:
+            trial_solution = mutant
+
+        return trial_solution
 
     def _collect_direction_data(self, agent_x, agent_y, minmax: str = "min"):
         """
@@ -590,15 +812,13 @@ class DirPLO(OriginalPLO):
                 predicted_direction = self._predict_direction(current_solution)
 
                 if predicted_direction is not None:
-                    # Calculate magnitude based on problem bounds and current epoch
-                    if not hasattr(self, 'base_magnitude'):
-                        self.base_magnitude = 0.1 * np.linalg.norm(np.array(self.problem.ub) - np.array(self.problem.lb))
+                    # Apply enhanced magnitude adjustment with population-based strategies
+                    pos_new = self._apply_enhanced_magnitude_adjustment(
+                        predicted_direction, current_solution, epoch, idx)
 
-                    # Adaptive magnitude that decreases over time
-                    magnitude = self.base_magnitude * (0.95 ** epoch)
-
-                    # Apply the predicted direction: current_solution + direction * magnitude
-                    pos_new = current_solution + magnitude * predicted_direction
+                    if pos_new is None:
+                        # Fallback to original PLO if enhanced adjustment fails
+                        use_prediction = False
                 else:
                     # Fallback to original PLO if prediction fails
                     use_prediction = False
@@ -639,8 +859,12 @@ class DirPLO(OriginalPLO):
                 better_agent = self._collect_direction_data(new_agent, old_agent, self.problem.minmax)
                 self.pop[i] = better_agent
 
+        # Adaptive training frequency: train less often as algorithm progresses
+        progress_ratio = epoch / self.epoch
+        adaptive_train_every = max(self.train_every, int(self.train_every * (1 + 2 * progress_ratio)))
+
         # Online learning: retrain when sufficient data is available
-        if (epoch % self.train_every == 0 and
+        if (epoch % adaptive_train_every == 0 and
             len(self.data) >= self.min_data_for_training):
             self._train_neural_network(epoch)
 
@@ -664,10 +888,13 @@ class DirPLO(OriginalPLO):
             all_data = self.data + augmented_data
 
             # Step 2: Initialize TensorBoard writer for this training session
-            try:
-                writer = SummaryWriter(log_dir='./logs/')
-            except Exception as e:
-                print(f"Warning: Failed to initialize TensorBoard writer: {e}")
+            if TENSORBOARD_AVAILABLE:
+                try:
+                    writer = SummaryWriter(log_dir='./logs/')
+                except Exception as e:
+                    print(f"Warning: Failed to initialize TensorBoard writer: {e}")
+                    writer = None
+            else:
                 writer = None
 
             # Step 3: Create train/validation split
@@ -706,7 +933,10 @@ class DirPLO(OriginalPLO):
                 except Exception as e:
                     print(f"Warning: Failed to log session metadata: {e}")
 
-            # Step 7: Training loop with comprehensive logging
+            # Step 7: Training loop with early stopping and comprehensive logging
+            best_val_loss = float('inf')
+            patience_counter = 0
+
             for e in range(self.n_grad_epochs):
                 # Training phase
                 self.dirnet.train()
@@ -745,6 +975,16 @@ class DirPLO(OriginalPLO):
                 # Calculate average losses
                 avg_train_loss = train_loss_total / train_batches if train_batches > 0 else 0
                 avg_val_loss = val_loss_total / val_batches if val_batches > 0 else 0
+
+                # Early stopping check
+                if avg_val_loss < best_val_loss - self.min_loss_improvement:
+                    best_val_loss = avg_val_loss
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+                    if patience_counter >= self.early_stopping_patience:
+                        # Early stopping triggered
+                        break
 
                 # Log to TensorBoard
                 if writer is not None:
