@@ -6,11 +6,9 @@ from optimizer import Optimizer
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from typing import Union, Dict, List, Tuple
-from utils import Target
-from torch.utils.tensorboard import SummaryWriter
+
 from torch.utils.data import Dataset, DataLoader
-from sklearn.model_selection import train_test_split
+from torch.utils.tensorboard import SummaryWriter
 
 from collections import deque
 
@@ -313,33 +311,17 @@ class KLEPLO(OriginalPLO):
 
 
 
-class FitnessNet(nn.Module):
-    """Simple network to predict fitness values from solutions"""
-    def __init__(self, inputs, hidden_nodes=32, dropout_rate=0.0):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(inputs, hidden_nodes),
-            nn.ReLU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(hidden_nodes, hidden_nodes // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(hidden_nodes // 2, 1)  # Single output for fitness
-        )
 
-    def forward(self, x):
-        return self.net(x).squeeze(-1)  # Remove last dimension
 
 class DirNet(nn.Module):
-    def __init__(self, inputs, hidden_nodes, outputs, dropout_rate=0.0):
+    """Simple neural network for direction prediction without dropout or weight decay"""
+    def __init__(self, inputs, hidden_nodes, outputs):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(inputs, hidden_nodes),
-            nn.GELU(),
-            nn.Dropout(dropout_rate),  # Configurable dropout rate
+            nn.ReLU(),
             nn.Linear(hidden_nodes, hidden_nodes),
-            nn.GELU(),
-            nn.Dropout(dropout_rate),
+            nn.ReLU(),
             nn.Linear(hidden_nodes, outputs)
         )
 
@@ -347,53 +329,7 @@ class DirNet(nn.Module):
         return self.net(x)
 
 
-class FitnessDataset(Dataset):
-    """Simple dataset for fitness prediction"""
 
-    def __init__(self, data, lb, ub, fitness_stats=None):
-        self.data_list = data
-        self.lb = torch.tensor(lb, dtype=torch.float32)
-        self.ub = torch.tensor(ub, dtype=torch.float32)
-
-        # Position normalization parameters (for features)
-        self.pos_scale = ((self.ub - self.lb) / 2.0).clone().detach().to(dtype=torch.float32)
-        self.pos_shift = ((self.ub + self.lb) / 2.0).clone().detach().to(dtype=torch.float32)
-
-        # Fitness normalization parameters (for labels)
-        if fitness_stats is None:
-            # Calculate fitness statistics from the data
-            fitness_values = [item['fitness'] for item in data]
-            if fitness_values:
-                self.fitness_mean = np.mean(fitness_values)
-                self.fitness_std = np.std(fitness_values) + 1e-8  # Add small epsilon
-            else:
-                self.fitness_mean = 0.0
-                self.fitness_std = 1.0
-        else:
-            self.fitness_mean, self.fitness_std = fitness_stats
-
-    def __len__(self):
-        return len(self.data_list)
-
-    def __getitem__(self, idx):
-        position = torch.tensor(self.data_list[idx]['position'], dtype=torch.float32)
-        fitness = self.data_list[idx]['fitness']
-
-        # Normalize position (feature) using position bounds
-        norm_position = (position - self.pos_shift) / self.pos_scale
-
-        # Normalize fitness (label) using fitness statistics
-        norm_fitness = (fitness - self.fitness_mean) / self.fitness_std
-
-        return norm_position, torch.tensor(norm_fitness, dtype=torch.float32)
-
-    def get_fitness_stats(self):
-        """Return fitness normalization statistics"""
-        return self.fitness_mean, self.fitness_std
-
-    def denormalize_fitness(self, norm_fitness):
-        """Denormalize a fitness value"""
-        return norm_fitness * self.fitness_std + self.fitness_mean
 
 class CustomDataset(Dataset):
 
@@ -445,38 +381,100 @@ class CustomDataset(Dataset):
 
     
 class DirPLO(OriginalPLO):
-    def __init__(self, epoch, pop_size, **kwargs):
-        super().__init__(epoch, pop_size, **kwargs)
-        self.epoch = epoch
-        self.pop_size = pop_size
+    """Enhanced PLO with neural network direction prediction, data augmentation, and online learning"""
 
+    def __init__(self, epoch, pop_size,
+                 prediction_usage_probability=0.5,
+                 min_data_for_training=1000,
+                 augmentation_factor=100,
+                 max_augmented_samples=100000,
+                 noise_std_ratio=0.1,
+                 train_every=10,
+                 n_grad_epochs=5,
+                 batch_size=4096,
+                 hidden_nodes=64,
+                 learning_rate=2e-3,
+                 **kwargs):
+        super().__init__(epoch, pop_size, **kwargs)
+
+        # Core parameters
+        self.prediction_usage_probability = prediction_usage_probability
+        self.min_data_for_training = min_data_for_training
+        self.augmentation_factor = augmentation_factor
+        self.max_augmented_samples = max_augmented_samples
+        self.noise_std_ratio = noise_std_ratio
+        self.train_every = train_every
+        self.n_grad_epochs = n_grad_epochs
+        self.batch_size = batch_size
+        self.hidden_nodes = hidden_nodes
+        self.learning_rate = learning_rate
+
+        # Neural network components
         self.dirnet = None
         self.optimizer = None
-        self.scheduler = None
-        self.batch_size = 256
-        self.hidden_nodes = 64
-        self.criterion = DirPLO.cosine_loss
-        self.writer = None
+        self.criterion = nn.MSELoss()  # Simple MSE loss for direction prediction
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model_trained = False
-        self.device = 'cpu'
-        self.train_every = 10
-        self.n_grad_epochs = 5
+
+        # Data management
         self.data = []
-        self.train_loader = []
-        self.val_loader = []
-        self.scheduler = None
+        self.augmented_data = []
+        self.train_loader = None
+        self.val_loader = None
 
-        # Fixed train/val split to prevent data leakage
-        self.fixed_train_indices = None
-        self.fixed_val_indices = None
-        self.last_split_size = 0
+        # Statistics for noise generation
+        self.noise_std = None
 
-        # Training configuration
-        self.dropout_rate = 0.0  # Disable dropout to fix train/val discrepancy
-        self.use_weight_decay = True
-        self.weight_decay = 1e-5  # Reduced weight decay
-        self.learning_rate = 5e-4  # Lower learning rate for stability
+        # Training session tracking for TensorBoard
+        self.training_session_count = 0
+        self.global_step_counter = 0
 
+    def _calculate_noise_std(self):
+        """Calculate noise standard deviation based on problem bounds"""
+        if self.noise_std is None:
+            bound_range = np.array(self.problem.ub) - np.array(self.problem.lb)
+            self.noise_std = self.noise_std_ratio * bound_range
+        return self.noise_std
+
+    def _augment_data(self, original_data):
+        """
+        Generate augmented data by adding noise to input positions while keeping directions unchanged.
+        Creates up to max_augmented_samples total samples.
+        """
+        if len(original_data) == 0:
+            return []
+
+        noise_std = self._calculate_noise_std()
+        augmented_samples = []
+
+        # Calculate how many augmented samples to generate per original sample
+        samples_per_original = min(self.augmentation_factor,
+                                 self.max_augmented_samples // len(original_data))
+
+        for original_sample in original_data:
+            start_pos = original_sample['start_pos']
+            direction = original_sample['direction']
+
+            # Generate augmented versions
+            for _ in range(samples_per_original):
+                # Add noise to the starting position
+                noise = self.generator.normal(0, noise_std, size=start_pos.shape)
+                noisy_start_pos = start_pos + noise
+
+                # Ensure the noisy position is within bounds
+                noisy_start_pos = np.clip(noisy_start_pos, self.problem.lb, self.problem.ub)
+
+                # Keep the same direction (this is the key insight)
+                augmented_samples.append({
+                    'start_pos': noisy_start_pos.copy(),
+                    'direction': direction.copy()
+                })
+
+                # Stop if we've reached the maximum number of samples
+                if len(augmented_samples) >= self.max_augmented_samples:
+                    return augmented_samples
+
+        return augmented_samples
 
     @staticmethod
     def cosine_loss(pred, tgt):
@@ -496,20 +494,10 @@ class DirPLO(OriginalPLO):
         mse_loss = DirPLO.mse_loss(pred, tgt)
         return alpha * cosine_loss + (1 - alpha) * mse_loss
 
-    def close_writer(self):
-        """Close the SummaryWriter if it exists"""
-        if hasattr(self, 'writer') and self.writer is not None:
-            self.writer.close()
-            self.writer = None
-
-    # Override the method to collect data for model training
-    def get_better_agent_with_data(self, agent_x, agent_y, minmax: str = "min", reverse: bool = False):
+    def _collect_direction_data(self, agent_x, agent_y, minmax: str = "min"):
         """
         Collect training data: direction from worse solution to better solution.
         This creates consistent training signal regardless of minmax setting.
-
-        Args:
-            reverse: Unused parameter kept for compatibility with parent class
         """
         # Determine which agent is better based on minmax
         if minmax == "min":
@@ -530,14 +518,47 @@ class DirPLO(OriginalPLO):
                 worse_agent = agent_x
 
         # Always collect data: from worse position toward better position
-        self.data.append({
-            'start_pos': worse_agent.solution.copy(),
-            'direction': better_agent.solution.copy() - worse_agent.solution.copy()
-        })
+        direction = better_agent.solution - worse_agent.solution
+        if np.linalg.norm(direction) > 1e-12:  # Only collect meaningful directions
+            self.data.append({
+                'start_pos': worse_agent.solution.copy(),
+                'direction': direction.copy()
+            })
 
         return better_agent.copy()
 
+    def _predict_direction(self, current_position):
+        """
+        Use the trained neural network to predict a direction from the current position.
+        Returns the predicted direction vector.
+        """
+        if not self.model_trained or self.dirnet is None:
+            return None
+
+        try:
+            self.dirnet.eval()
+            with torch.no_grad():
+                # Normalize input using position bounds (same as training)
+                pos_tensor = torch.tensor(current_position, dtype=torch.float32).to(self.device)
+                pos_scale = ((torch.tensor(self.problem.ub, dtype=torch.float32) -
+                            torch.tensor(self.problem.lb, dtype=torch.float32)) / 2.0).to(self.device)
+                pos_shift = ((torch.tensor(self.problem.ub, dtype=torch.float32) +
+                            torch.tensor(self.problem.lb, dtype=torch.float32)) / 2.0).to(self.device)
+                norm_input = (pos_tensor - pos_shift) / pos_scale
+
+                # Get prediction
+                predicted_direction = self.dirnet(norm_input.unsqueeze(0)).squeeze(0)
+                return predicted_direction.cpu().numpy()
+
+        except Exception as e:
+            if self.logger:
+                self.logger.warning(f"Direction prediction error: {e}")
+            return None
+
     def evolve(self, epoch):
+        """
+        Enhanced evolve method with 50% probability neural network usage and online learning
+        """
         # Calculate progress percentage for adaptive parameters
         progress_ratio = epoch / self.epoch
 
@@ -557,152 +578,147 @@ class DirPLO(OriginalPLO):
         pop_new = []
 
         for idx in range(self.pop_size):
+            current_solution = self.pop[idx].solution.copy()
 
-            if self.model_trained and self.dirnet is not None:
-                # --- ask the net ---
-                inp = torch.tensor(self.pop[idx].solution, dtype=torch.float32)
-                with torch.no_grad():
-                    # Normalize input using position bounds (same as training)
-                    pos_scale = ((torch.tensor(self.problem.ub, dtype=torch.float32) - torch.tensor(self.problem.lb, dtype=torch.float32)) / 2.0)
-                    pos_shift = ((torch.tensor(self.problem.ub, dtype=torch.float32) + torch.tensor(self.problem.lb, dtype=torch.float32)) / 2.0)
-                    norm_inp = (inp - pos_shift) / pos_scale
+            # Decide whether to use neural network prediction (50% probability when trained)
+            use_prediction = (self.model_trained and
+                            self.dirnet is not None and
+                            self.generator.random() < self.prediction_usage_probability)
 
-                    dir_unit = self.dirnet(norm_inp.to(self.device))
-                    dir_unit = dir_unit.detach().cpu().numpy()
-                    dir_unit /= np.linalg.norm(dir_unit) + 1e-12  # force unit
+            if use_prediction:
+                # Use neural network to predict direction
+                predicted_direction = self._predict_direction(current_solution)
 
-                if not hasattr(self, 'sigma0'):
-                    self.sigma0 = 0.1 * np.linalg.norm(self.problem.ub - self.problem.lb)
-                tau = 0.95
-                sigma = self.sigma0 * (tau ** epoch)
-                pos_new = self.pop[idx].solution + sigma * dir_unit
+                if predicted_direction is not None:
+                    # Calculate magnitude based on problem bounds and current epoch
+                    if not hasattr(self, 'base_magnitude'):
+                        self.base_magnitude = 0.1 * np.linalg.norm(np.array(self.problem.ub) - np.array(self.problem.lb))
 
-            else:
-                # --- aurora-oval walk + Lévy flight ---------------------------------
+                    # Adaptive magnitude that decreases over time
+                    magnitude = self.base_magnitude * (0.95 ** epoch)
+
+                    # Apply the predicted direction: current_solution + direction * magnitude
+                    pos_new = current_solution + magnitude * predicted_direction
+                else:
+                    # Fallback to original PLO if prediction fails
+                    use_prediction = False
+
+            if not use_prediction:
+                # Original PLO aurora-oval walk + Lévy flight
                 a = self.generator.uniform() / 2 + 1
                 V = np.exp((1 - a) / 100 * epoch)
                 LS = V
                 GS = (self.levy(self.problem.n_dims) *
-                      (x_mean - self.pop[idx].solution +
-                       (self.problem.lb + self.generator.uniform(0, 1,
-                                                                 self.problem.n_dims) *
+                      (x_mean - current_solution +
+                       (self.problem.lb + self.generator.uniform(0, 1, self.problem.n_dims) *
                         (self.problem.ub - self.problem.lb)) / 2))
-                pos_new = (self.pop[idx].solution +
+                pos_new = (current_solution +
                            (w1 * LS + w2 * GS) *
                            self.generator.uniform(0, 1, self.problem.n_dims))
 
-            # --- optional collision (one *extra* random perturbation) ---------------
+            # Optional collision (additional random perturbation)
             if self.generator.random() < 0.05 and self.generator.random() < E:
-                j = self.generator.integers(0, self.problem.n_dims)  # pick one dim
+                j = self.generator.integers(0, self.problem.n_dims)
                 pos_new[j] += np.sin(self.generator.random() * np.pi) * \
-                              (self.pop[idx].solution[j] -
-                               self.pop[A[idx]].solution[j])
+                              (current_solution[j] - self.pop[A[idx]].solution[j])
 
-            # --- clip to bounds & add to new pop ------------------------------------
+            # Clip to bounds and create new agent
             pos_new = self.correct_solution(pos_new)
-            agent = self.generate_agent(pos_new)
+            agent = self.generate_empty_agent(pos_new)
             pop_new.append(agent)
-
 
             if self.mode not in self.AVAILABLE_MODES:
                 agent.target = self.get_target(pos_new)
-                self.pop[idx] = self.get_better_agent_with_data(agent, self.pop[idx], self.problem.minmax)
+                # Collect data and update population
+                self.pop[idx] = self._collect_direction_data(agent, self.pop[idx], self.problem.minmax)
 
-        if epoch % self.train_every == 0 and len(self.data) > 1024:
-            self.train_dirnet(epoch)
+        if self.mode in self.AVAILABLE_MODES:
+            pop_new = self.update_target_for_population(pop_new)
+            # Collect data during population update
+            for i, (old_agent, new_agent) in enumerate(zip(self.pop, pop_new)):
+                better_agent = self._collect_direction_data(new_agent, old_agent, self.problem.minmax)
+                self.pop[i] = better_agent
 
-    def _create_fixed_train_val_split(self, data_size):
-        """Create a fixed train/validation split that doesn't change between training sessions"""
-        if (self.fixed_train_indices is None or
-            self.fixed_val_indices is None or
-            self.last_split_size != data_size):
+        # Online learning: retrain when sufficient data is available
+        if (epoch % self.train_every == 0 and
+            len(self.data) >= self.min_data_for_training):
+            self._train_neural_network(epoch)
 
-            # Create new fixed split
-            indices = np.arange(data_size)
-            train_indices, val_indices = train_test_split(
-                indices, test_size=0.2, random_state=42, shuffle=True
-            )
-            self.fixed_train_indices = train_indices
-            self.fixed_val_indices = val_indices
-            self.last_split_size = data_size
-            print(f"Created new fixed train/val split: {len(train_indices)} train, {len(val_indices)} val")
+    def _train_neural_network(self, epoch):
+        """
+        Train the neural network with data augmentation, online learning, and comprehensive TensorBoard logging.
+        Generates 100k+ samples through augmentation before training.
+        """
+        if len(self.data) < self.min_data_for_training:
+            return
 
-        return self.fixed_train_indices, self.fixed_val_indices
-
-    def train_dirnet(self, epoch):
-        """Train DirNet periodically during the run."""
-        if epoch < self.epoch // 2:
-            return                      # Wait until halfway through the run
+        # Increment training session counter
+        self.training_session_count += 1
+        writer = None
 
         try:
-            # 1.  Build the data sets ------------------------------------------------
-            self.data = self.data[-10240:]
+            # Step 1: Generate augmented data
+            augmented_data = self._augment_data(self.data)
 
-            if len(self.data) < 100:  # Need minimum data for meaningful training
-                print(f"Insufficient data for training: {len(self.data)} samples")
-                return
+            # Combine original and augmented data
+            all_data = self.data + augmented_data
 
-            # Use fixed train/val split to prevent data leakage
-            train_indices, val_indices = self._create_fixed_train_val_split(len(self.data))
-            train = [self.data[i] for i in train_indices]
-            val = [self.data[i] for i in val_indices]
+            # Step 2: Initialize TensorBoard writer for this training session
+            try:
+                writer = SummaryWriter(log_dir='./logs/')
+            except Exception as e:
+                print(f"Warning: Failed to initialize TensorBoard writer: {e}")
+                writer = None
 
-            # Create training dataset first to get direction statistics
-            train_ds = CustomDataset(train, self.problem.lb, self.problem.ub)
-            # Use same direction statistics for validation to prevent data leakage
-            dir_stats = train_ds.get_direction_stats()
-            val_ds = CustomDataset(val, self.problem.lb, self.problem.ub, pos_stats=dir_stats)
+            # Step 3: Create train/validation split
+            train_size = int(0.8 * len(all_data))
+            indices = np.arange(len(all_data))
+            np.random.shuffle(indices)
 
-            self.train_loader = DataLoader(train_ds, batch_size=self.batch_size,
-                                      shuffle=True, drop_last=False)
-            self.val_loader   = DataLoader(val_ds,   batch_size=self.batch_size,
-                                      shuffle=False, drop_last=False)
+            train_data = [all_data[i] for i in indices[:train_size]]
+            val_data = [all_data[i] for i in indices[train_size:]]
 
-            # 2.  Initialize the net only if it doesn't exist ------------------------
+            # Step 4: Create datasets and data loaders
+            train_dataset = CustomDataset(train_data, self.problem.lb, self.problem.ub)
+            dir_stats = train_dataset.get_direction_stats()
+            val_dataset = CustomDataset(val_data, self.problem.lb, self.problem.ub, pos_stats=dir_stats)
+
+            train_loader = DataLoader(train_dataset, batch_size=self.batch_size,
+                                    shuffle=True, drop_last=False)
+            val_loader = DataLoader(val_dataset, batch_size=self.batch_size,
+                                  shuffle=False, drop_last=False)
+
+            # Step 5: Initialize network if needed
             if self.dirnet is None:
                 self.dirnet = DirNet(self.problem.n_dims, self.hidden_nodes,
-                                   self.problem.n_dims, dropout_rate=self.dropout_rate).to(self.device)
+                                   self.problem.n_dims).to(self.device)
 
-            # Always create new writer and optimizer for this training session
-            self.writer = SummaryWriter('./log/')
+            # Step 6: Setup optimizer (simple Adam without weight decay)
+            self.optimizer = optim.Adam(self.dirnet.parameters(), lr=self.learning_rate)
 
-            # Use more conservative training settings
-            if self.use_weight_decay:
-                self.optimizer = optim.AdamW(self.dirnet.parameters(),
-                                           lr=self.learning_rate,
-                                           weight_decay=self.weight_decay)
-            else:
-                self.optimizer = optim.Adam(self.dirnet.parameters(), lr=self.learning_rate)
+            # Log session metadata to TensorBoard
+            if writer is not None:
+                try:
+                    writer.add_scalar(f'Session_Info/{self.problem.name}/Original_Data_Size', len(self.data), self.training_session_count)
+                    writer.add_scalar(f'Session_Info/{self.problem.name}/Augmented_Data_Size', len(augmented_data), self.training_session_count)
+                    writer.add_scalar(f'Session_Info/{self.problem.name}/Total_Data_Size', len(all_data), self.training_session_count)
+                    writer.add_scalar(f'Session_Info/{self.problem.name}/PLO_Epoch', epoch, self.training_session_count)
+                except Exception as e:
+                    print(f"Warning: Failed to log session metadata: {e}")
 
-            # Use simpler scheduler to avoid training instability
-            self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=2, gamma=0.8)
-
-            # 3.  Train for a few *gradient* epochs, not 100 full passes -------------
-            print(f"Training DirNet at epoch {epoch} with {len(train)} train samples, {len(val)} val samples")
-            print(f"Train loader batches: {len(self.train_loader)}, Val loader batches: {len(self.val_loader)}")
-            print(f"Using dropout: {self.dropout_rate}, weight_decay: {self.weight_decay}, lr: {self.learning_rate}")
-
-            # ─────────────────── train & validate each epoch ───────────────────
+            # Step 7: Training loop with comprehensive logging
             for e in range(self.n_grad_epochs):
-                # training loop --------------------------------------------------
+                # Training phase
                 self.dirnet.train()
-                train_loss_acc = 0.0
-                train_batch_count = 0
-                train_cosine_similarities = []
+                train_loss_total = 0.0
+                train_batches = 0
 
-                for x, y in self.train_loader:
-                    x, y = x.to(self.device), y.to(self.device)
+                for batch_x, batch_y in train_loader:
+                    batch_x, batch_y = batch_x.to(self.device), batch_y.to(self.device)
 
                     # Forward pass
-                    pred = self.dirnet(x)
-                    loss = self.criterion(pred, y)
-
-                    # Calculate cosine similarity for monitoring (before normalization)
-                    with torch.no_grad():
-                        pred_norm = pred / (pred.norm(dim=1, keepdim=True) + 1e-12)
-                        y_norm = y / (y.norm(dim=1, keepdim=True) + 1e-12)
-                        cosine_sim = (pred_norm * y_norm).sum(dim=1).mean().item()
-                        train_cosine_similarities.append(cosine_sim)
+                    predictions = self.dirnet(batch_x)
+                    loss = self.criterion(predictions, batch_y)
 
                     # Backward pass
                     self.optimizer.zero_grad()
@@ -710,56 +726,62 @@ class DirPLO(OriginalPLO):
                     torch.nn.utils.clip_grad_norm_(self.dirnet.parameters(), 1.0)
                     self.optimizer.step()
 
-                    train_loss_acc += loss.item()
-                    train_batch_count += 1
+                    train_loss_total += loss.item()
+                    train_batches += 1
 
-                # Step scheduler once per epoch, not per batch
-                self.scheduler.step()
-                train_loss = train_loss_acc / train_batch_count
-                avg_train_cosine = np.mean(train_cosine_similarities)
-
-                # validation loop ------------------------------------------------
+                # Validation phase
                 self.dirnet.eval()
-                val_loss_acc = 0.0
-                val_batch_count = 0
-                val_cosine_similarities = []
+                val_loss_total = 0.0
+                val_batches = 0
 
                 with torch.no_grad():
-                    for x, y in self.val_loader:
-                        x, y = x.to(self.device), y.to(self.device)
-                        pred = self.dirnet(x)
-                        loss = self.criterion(pred, y)
+                    for batch_x, batch_y in val_loader:
+                        batch_x, batch_y = batch_x.to(self.device), batch_y.to(self.device)
+                        predictions = self.dirnet(batch_x)
+                        loss = self.criterion(predictions, batch_y)
+                        val_loss_total += loss.item()
+                        val_batches += 1
 
-                        # Calculate cosine similarity for monitoring
-                        pred_norm = pred / (pred.norm(dim=1, keepdim=True) + 1e-12)
-                        y_norm = y / (y.norm(dim=1, keepdim=True) + 1e-12)
-                        cosine_sim = (pred_norm * y_norm).sum(dim=1).mean().item()
-                        val_cosine_similarities.append(cosine_sim)
+                # Calculate average losses
+                avg_train_loss = train_loss_total / train_batches if train_batches > 0 else 0
+                avg_val_loss = val_loss_total / val_batches if val_batches > 0 else 0
 
-                        val_loss_acc += loss.item()
-                        val_batch_count += 1
+                # Log to TensorBoard
+                if writer is not None:
+                    try:
+                        # Log losses using add_scalars for combined plot
+                        writer.add_scalars(f'Loss/{self.problem.name}/', {
+                            'train': avg_train_loss,
+                            'val': avg_val_loss
+                        }, self.global_step_counter)
 
-                val_loss = val_loss_acc / val_batch_count
-                avg_val_cosine = np.mean(val_cosine_similarities)
+                        # Log learning rate
+                        writer.add_scalar(f'Training/{self.problem.name}/Learning_Rate', self.optimizer.param_groups[0]['lr'], self.global_step_counter)
 
-                print(f"Epoch {e}: Train Loss = {train_loss:.6f}, Val Loss = {val_loss:.6f}")
-                print(f"         Train Cosine = {avg_train_cosine:.6f}, Val Cosine = {avg_val_cosine:.6f}")
-                print(f"         LR = {self.optimizer.param_groups[0]['lr']:.6e}")
+                        # Log session information for context
+                        writer.add_scalar(f'Training/{self.problem.name}/Session_Number', self.training_session_count, self.global_step_counter)
+                        writer.add_scalar(f'Training/{self.problem.name}/Gradient_Epoch', e + 1, self.global_step_counter)
 
-                # log *each* grad‑epoch (smooth curves, unique x‑axis)
-                self.writer.add_scalars(f'Loss/{self.problem.name}', {
-                    'train': train_loss,
-                    'val':   val_loss
-                }, epoch * self.n_grad_epochs + e)  # Use unique x-axis across all training sessions
+                    except Exception as e:
+                        print(f"Warning: Failed to log to TensorBoard: {e}")
 
-                self.writer.add_scalars(f'CosineSimilarity/{self.problem.name}', {
-                    'train': avg_train_cosine,
-                    'val':   avg_val_cosine
-                }, epoch * self.n_grad_epochs + e)
+                # Increment global step counter
+                self.global_step_counter += 1
 
-            # Mark model as trained for the first time (for inference usage)
-            if not self.model_trained:
-                self.model_trained = True
+            # Mark model as trained
+            self.model_trained = True
+            # Optional brief success message (can be commented out for even quieter operation)
+            # print(f"Neural network training session {self.training_session_count} completed")
+
+        except Exception as e:
+            print(f"Error during neural network training: {e}")
+            if self.logger:
+                self.logger.error(f"Neural network training failed: {e}")
+
         finally:
-            self.close_writer()
-    # ---------------------------------------------------------------------------
+            # Always close the TensorBoard writer
+            if writer is not None:
+                try:
+                    writer.close()
+                except Exception as e:
+                    print(f"Warning: Failed to close TensorBoard writer: {e}")
