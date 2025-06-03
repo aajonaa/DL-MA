@@ -393,15 +393,12 @@ class DirPLO(OriginalPLO):
 
     def __init__(self, epoch, pop_size,
                  prediction_usage_probability=0.5,
-                 min_data_for_training=100,  # Much lower for small problems
-                 augmentation_factor=50,  # Reduced from 100
-                 max_augmented_samples=50000,  # Reduced from 100000
-                 noise_std_ratio=0.1,
-                 train_every=10,  # Back to more frequent training
+                 min_data_for_training=256,  # Much lower for small problems
+                 train_every=50,  # Back to more frequent training
                  n_grad_epochs=3,  # Reduced from 5 (fewer training epochs)
-                 batch_size=4096,  # Reasonable batch size
-                 hidden_nodes=32,  # Reduced network size
-                 learning_rate=5e-3,  # Increased learning rate for faster convergence
+                 batch_size=32,  # Reasonable batch size
+                 hidden_nodes=8,  # Reduced network size
+                 learning_rate=1e-3,  # Increased learning rate for faster convergence
                  # Enhanced magnitude adjustment parameters
                  magnitude_strategy='adaptive_multi',  # 'simple', 'de_style', 'pso_style', 'adaptive_multi'
                  base_f_factor=0.5,
@@ -409,16 +406,14 @@ class DirPLO(OriginalPLO):
                  crossover_rate=0.7,
                  use_population_guidance=True,
                  diversity_threshold=0.1,
-                 fast_mode=False,  # Enable for maximum speed
                  **kwargs):
         super().__init__(epoch, pop_size, **kwargs)
 
         # Core parameters
         self.prediction_usage_probability = prediction_usage_probability
         self.min_data_for_training = min_data_for_training
-        self.augmentation_factor = augmentation_factor
-        self.max_augmented_samples = max_augmented_samples
-        self.noise_std_ratio = noise_std_ratio
+        # self.augmentation_factor = augmentation_factor
+        # self.max_augmented_samples = max_augmented_samples
         self.train_every = train_every
         self.n_grad_epochs = n_grad_epochs
         self.batch_size = batch_size
@@ -433,15 +428,6 @@ class DirPLO(OriginalPLO):
         self.use_population_guidance = use_population_guidance
         self.diversity_threshold = diversity_threshold
 
-        # Fast mode adjustments
-        if fast_mode:
-            self.min_data_for_training = 50  # Even lower threshold
-            self.train_every = max(30, self.train_every * 2)  # Train less frequently
-            self.n_grad_epochs = max(1, self.n_grad_epochs // 2)  # Fewer epochs
-            self.max_augmented_samples = min(5000, self.max_augmented_samples // 10)  # Much less augmentation
-            self.augmentation_factor = max(5, self.augmentation_factor // 10)  # Much less augmentation
-            self.early_stopping_patience = 1  # More aggressive early stopping
-
         # Neural network components
         self.dirnet = None
         self.optimizer = None
@@ -451,7 +437,6 @@ class DirPLO(OriginalPLO):
 
         # Data management
         self.data = []
-        self.augmented_data = []
         self.train_loader = None
         self.val_loader = None
 
@@ -459,7 +444,6 @@ class DirPLO(OriginalPLO):
         self.noise_std = None
 
         # Training session tracking for TensorBoard
-        self.training_session_count = 0
         self.global_step_counter = 0
 
         # Performance optimization parameters
@@ -467,53 +451,6 @@ class DirPLO(OriginalPLO):
         self.min_loss_improvement = 1e-5  # Minimum improvement threshold
         self.last_training_loss = float('inf')
         self.no_improvement_count = 0
-
-    def _calculate_noise_std(self):
-        """Calculate noise standard deviation based on problem bounds"""
-        if self.noise_std is None:
-            bound_range = np.array(self.problem.ub) - np.array(self.problem.lb)
-            self.noise_std = self.noise_std_ratio * bound_range
-        return self.noise_std
-
-    def _augment_data(self, original_data):
-        """
-        Generate augmented data by adding noise to input positions while keeping directions unchanged.
-        Creates up to max_augmented_samples total samples.
-        """
-        if len(original_data) == 0:
-            return []
-
-        noise_std = self._calculate_noise_std()
-        augmented_samples = []
-
-        # Calculate how many augmented samples to generate per original sample
-        samples_per_original = min(self.augmentation_factor,
-                                 self.max_augmented_samples // len(original_data))
-
-        for original_sample in original_data:
-            start_pos = original_sample['start_pos']
-            direction = original_sample['direction']
-
-            # Generate augmented versions
-            for _ in range(samples_per_original):
-                # Add noise to the starting position
-                noise = self.generator.normal(0, noise_std, size=start_pos.shape)
-                noisy_start_pos = start_pos + noise
-
-                # Ensure the noisy position is within bounds
-                noisy_start_pos = np.clip(noisy_start_pos, self.problem.lb, self.problem.ub)
-
-                # Keep the same direction (this is the key insight)
-                augmented_samples.append({
-                    'start_pos': noisy_start_pos.copy(),
-                    'direction': direction.copy()
-                })
-
-                # Stop if we've reached the maximum number of samples
-                if len(augmented_samples) >= self.max_augmented_samples:
-                    return augmented_samples
-
-        return augmented_samples
 
     @staticmethod
     def cosine_loss(pred, tgt):
@@ -863,6 +800,9 @@ class DirPLO(OriginalPLO):
         progress_ratio = epoch / self.epoch
         adaptive_train_every = max(self.train_every, int(self.train_every * (1 + 2 * progress_ratio)))
 
+        if len(self.data) > 1024:
+            self.data = self.data[-1024:]
+
         # Online learning: retrain when sufficient data is available
         if (epoch % adaptive_train_every == 0 and
             len(self.data) >= self.min_data_for_training):
@@ -877,18 +817,11 @@ class DirPLO(OriginalPLO):
             return
 
         # Increment training session counter
-        self.training_session_count += 1
         writer = None
 
         try:
-            # Step 1: Generate augmented data
-            augmented_data = self._augment_data(self.data)
-
-            # Combine original and augmented data
-            all_data = self.data + augmented_data
-
             # Step 2: Initialize TensorBoard writer for this training session
-            if TENSORBOARD_AVAILABLE:
+            if False and TENSORBOARD_AVAILABLE:
                 try:
                     writer = SummaryWriter(log_dir='./logs/')
                 except Exception as e:
@@ -898,12 +831,12 @@ class DirPLO(OriginalPLO):
                 writer = None
 
             # Step 3: Create train/validation split
-            train_size = int(0.8 * len(all_data))
-            indices = np.arange(len(all_data))
+            train_size = int(0.8 * len(self.data))
+            indices = np.arange(len(self.data))
             np.random.shuffle(indices)
 
-            train_data = [all_data[i] for i in indices[:train_size]]
-            val_data = [all_data[i] for i in indices[train_size:]]
+            train_data = [self.data[i] for i in indices[:train_size]]
+            val_data = [self.data[i] for i in indices[train_size:]]
 
             # Step 4: Create datasets and data loaders
             train_dataset = CustomDataset(train_data, self.problem.lb, self.problem.ub)
@@ -922,16 +855,6 @@ class DirPLO(OriginalPLO):
 
             # Step 6: Setup optimizer (simple Adam without weight decay)
             self.optimizer = optim.Adam(self.dirnet.parameters(), lr=self.learning_rate)
-
-            # Log session metadata to TensorBoard
-            if writer is not None:
-                try:
-                    writer.add_scalar(f'Session_Info/{self.problem.name}/Original_Data_Size', len(self.data), self.training_session_count)
-                    writer.add_scalar(f'Session_Info/{self.problem.name}/Augmented_Data_Size', len(augmented_data), self.training_session_count)
-                    writer.add_scalar(f'Session_Info/{self.problem.name}/Total_Data_Size', len(all_data), self.training_session_count)
-                    writer.add_scalar(f'Session_Info/{self.problem.name}/PLO_Epoch', epoch, self.training_session_count)
-                except Exception as e:
-                    print(f"Warning: Failed to log session metadata: {e}")
 
             # Step 7: Training loop with early stopping and comprehensive logging
             best_val_loss = float('inf')
@@ -998,10 +921,6 @@ class DirPLO(OriginalPLO):
                         # Log learning rate
                         writer.add_scalar(f'Training/{self.problem.name}/Learning_Rate', self.optimizer.param_groups[0]['lr'], self.global_step_counter)
 
-                        # Log session information for context
-                        writer.add_scalar(f'Training/{self.problem.name}/Session_Number', self.training_session_count, self.global_step_counter)
-                        writer.add_scalar(f'Training/{self.problem.name}/Gradient_Epoch', e + 1, self.global_step_counter)
-
                     except Exception as e:
                         print(f"Warning: Failed to log to TensorBoard: {e}")
 
@@ -1010,8 +929,6 @@ class DirPLO(OriginalPLO):
 
             # Mark model as trained
             self.model_trained = True
-            # Optional brief success message (can be commented out for even quieter operation)
-            # print(f"Neural network training session {self.training_session_count} completed")
 
         except Exception as e:
             print(f"Error during neural network training: {e}")
