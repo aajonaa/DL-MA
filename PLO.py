@@ -317,10 +317,6 @@ class KLEPLO(OriginalPLO):
         if epoch >= self.klm_warmup_epochs and epoch % self.klm_training_freq == 0 and self.klm_initialized:
             self._train_klm_net()
 
-
-
-
-
 class DirNet(nn.Module):
     """Simple neural network for direction prediction without dropout or weight decay"""
     def __init__(self, inputs, hidden_nodes, outputs):
@@ -335,8 +331,6 @@ class DirNet(nn.Module):
 
     def forward(self, x):
         return self.net(x)
-
-
 
 
 class CustomDataset(Dataset):
