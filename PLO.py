@@ -2455,6 +2455,7 @@ class NDGPLO_BSA(SimpleBSANDGPLO):
             self.data = self.data[-1024:]
 
 
+# Only using the mutant assisted by the network
 class NDGPLO(OriginalPLO):
     """
     IMPROVED Neural Direction Guided PLO - Conservative Neural Integration
@@ -2473,7 +2474,7 @@ class NDGPLO(OriginalPLO):
     """
 
     def __init__(self, epoch, pop_size,
-                 prediction_usage_probability=0.7,  # Probability of using neural predictions
+                 prediction_usage_probability=1.0,  # Probability of using neural predictions
                  min_data_for_training=256,
                  train_every=50,
                  n_grad_epochs=3,
@@ -2730,7 +2731,7 @@ class NDGPLO(OriginalPLO):
         F = 3 * self.generator.random()  # BSA standard: F ∈ [0, 3]
 
         # BSA's PROVEN FORMULA: Mutant = oldP + F * (P1 - P2)
-        bsa_mutant = oldP + F * (P1 - P2)
+        # bsa_mutant = oldP + F * (P1 - P2)
 
         # Neural enhancement: Try to get predicted direction
         use_neural_guidance = (self.model_trained and
@@ -2740,7 +2741,456 @@ class NDGPLO(OriginalPLO):
         if use_neural_guidance:
             predicted_direction = self._predict_direction(current_agent.solution)
 
-            if predicted_direction is not None:
+            # bsa_mutant = oldP + F * (P1 - P2)
+            bsa_mutant = oldP + F * predicted_direction
+
+            if False and predicted_direction is not None:
+                # Apply conservative neural enhancement (NDGPLO_BSA pattern)
+                enhanced_solution = self._conservative_neural_enhancement(
+                    current_agent.solution, bsa_mutant, predicted_direction, progress_ratio)
+                return self.correct_solution(enhanced_solution)
+            else:
+                # Fallback to standard BSA mutation
+                return self.correct_solution(bsa_mutant)
+        else:
+            # Use standard BSA mutation
+            return self.correct_solution(bsa_mutant)
+
+    def _apply_original_plo_operator(self, current_agent, epoch, agent_idx):
+        """
+        Apply original PLO operators to a single agent.
+        Uses PLO's Aurora Oval Walk, Levy Flight, and Particle Collision.
+        """
+        progress_ratio = epoch / self.epoch
+        current_solution = current_agent.solution.copy()
+
+        # Calculate mean position of the population
+        x_mean = np.mean([agent.solution for agent in self.pop], axis=0)
+
+        # Calculate adaptive weights for PLO components
+        w1 = np.tanh((progress_ratio) ** 4)
+        w2 = np.exp(-(2 * progress_ratio) ** 3)
+
+        # E for particle collision
+        E = np.sqrt(progress_ratio)
+
+        # Generate random permutation for collision pairs
+        A = self.generator.permutation(self.pop_size)
+
+        # Aurora oval walk
+        a = self.generator.uniform() / 2 + 1
+        V = np.exp((1 - a) / 100 * epoch)
+        LS = V
+
+        # Levy flight movement component
+        GS = self.levy(self.problem.n_dims) * (x_mean - current_solution +
+                                               (self.problem.lb + self.generator.uniform(0, 1, self.problem.n_dims) *
+                                                (self.problem.ub - self.problem.lb)) / 2)
+
+        # Standard PLO position update
+        plo_movement = current_solution + (w1 * LS + w2 * GS) * self.generator.uniform(0, 1, self.problem.n_dims)
+
+        # Particle collision
+        for j in range(self.problem.n_dims):
+            if (self.generator.random() < 0.05) and (self.generator.random() < E):
+                plo_movement[j] = current_solution[j] + np.sin(self.generator.random() * np.pi) * \
+                                 (current_solution[j] - self.pop[A[agent_idx]].solution[j])
+
+        return self.correct_solution(plo_movement)
+
+    def _apply_hybrid_ndgplo_algorithm(self, epoch):
+        """
+        HYBRID NDGPLO: Probabilistic combination of NDGPLO_BSA and Original PLO
+
+        Strategy:
+        - When neural network is trained: 50% NDGPLO_BSA + 50% Original PLO
+        - When neural network not trained: 100% Original PLO (fallback)
+
+        This maintains NDGPLO_BSA's high performance while adding PLO's exploration diversity.
+        """
+        progress_ratio = epoch / self.epoch
+
+        # Update BSA historical population periodically (for NDGPLO_BSA operators)
+        if hasattr(self, 'historical_population') and len(self.historical_population) > 0:
+            # BSA Selection-I: Decide whether to update historical population
+            a = self.generator.random()
+            b = self.generator.random()
+
+            if a < b:
+                # Update historical population with current population
+                self.historical_population = [agent.copy() for agent in self.pop]
+
+            # Permute (shuffle) the historical population - CRITICAL BSA STEP
+            permuted_indices = self.generator.permutation(len(self.historical_population))
+            self.historical_population = [self.historical_population[i] for i in permuted_indices]
+
+        # === HYBRID POPULATION GENERATION ===
+        new_population = []
+
+        for idx in range(self.pop_size):
+            current_agent = self.pop[idx]
+
+            # Hybrid algorithm selection logic
+            if self.model_trained:  # Only use hybrid approach when neural network is trained
+                if self.generator.random() < 0.5:  # 50% probability
+                    # Generate solution using NDGPLO_BSA approach (proven high performance)
+                    new_solution = self._apply_ndgplo_bsa_operator(current_agent, epoch, idx)
+                    operator_used = "NDGPLO_BSA"
+                else:
+                    # Generate solution using original PLO approach (exploration diversity)
+                    new_solution = self._apply_original_plo_operator(current_agent, epoch, idx)
+                    operator_used = "Original_PLO"
+            else:
+                # Fallback to pure original PLO when neural network not trained
+                new_solution = self._apply_original_plo_operator(current_agent, epoch, idx)
+                operator_used = "Original_PLO_Fallback"
+
+            # Create new agent
+            new_agent = self.generate_empty_agent(new_solution)
+            new_agent.target = self.get_target(new_solution)
+
+            # Collect direction data for neural network training
+            self._collect_direction_data(current_agent, new_agent, self.problem.minmax)
+
+            # Selection: Choose better agent (BSA-style selection)
+            if new_agent.is_better_than(current_agent, self.problem.minmax):
+                new_population.append(new_agent)
+            else:
+                new_population.append(current_agent)
+
+        # === COMPLETE POPULATION REPLACEMENT (BSA-Style) ===
+        # Replace ENTIRE population at once (maintains BSA's successful structure)
+        self.pop = new_population
+
+        # Update global best
+        for agent in self.pop:
+            if agent.is_better_than(self.g_best, self.problem.minmax):
+                self.g_best = agent.copy()
+
+        return True  # Hybrid NDGPLO algorithm completed successfully
+
+    def evolve(self, epoch):
+        """
+        HYBRID NDGPLO: Probabilistic Combination of NDGPLO_BSA and Original PLO
+
+        STRATEGIC APPROACH: Combines the proven high performance of NDGPLO_BSA
+        with PLO's exploration characteristics through probabilistic selection.
+
+        Algorithm Strategy:
+        - When neural network is trained: 50% NDGPLO_BSA + 50% Original PLO
+        - When neural network not trained: 100% Original PLO (fallback)
+
+        Key Benefits:
+        - Maintains NDGPLO_BSA's high performance (50% of solutions use proven BSA formula)
+        - Adds PLO's exploration diversity (50% of solutions use PLO operators)
+        - Uses same population-level processing that makes NDGPLO_BSA successful
+        - Conservative neural enhancement strategy from NDGPLO_BSA
+
+        Expected Performance: Equal to or better than pure NDGPLO_BSA
+        """
+        # Apply hybrid NDGPLO algorithm (NDGPLO_BSA + Original PLO)
+        self._apply_hybrid_ndgplo_algorithm(epoch)
+
+        # Periodic neural network training
+        if (epoch % self.train_every == 0 and
+            len(self.data) >= self.min_data_for_training):
+            self._train_neural_network(epoch)
+
+        # Limit data size to prevent memory issues
+        if len(self.data) > 1024:
+            self.data = self.data[-1024:]
+
+
+# Using the mutant and complex directions to generate new solutions
+class NDGPLO2(OriginalPLO):
+    """
+    IMPROVED Neural Direction Guided PLO - Conservative Neural Integration
+
+    Based on successful patterns from NDGPLO_BSA:
+    - Conservative neural integration with gradual progression
+    - Simple, robust blending strategy inspired by NDGPLO_BSA success
+    - Focus on enhancing PLO's core movement rather than all components
+    - Reliable fallback to pure PLO when neural predictions unavailable
+
+    Key Improvements:
+    - Single conservative enhancement factor (like NDGPLO_BSA)
+    - Progressive neural influence starting from 0%
+    - Simplified integration without multi-component interference
+    - Robust fallback mechanisms
+    """
+
+    def __init__(self, epoch, pop_size,
+                 prediction_usage_probability=1.0,  # Probability of using neural predictions
+                 min_data_for_training=256,
+                 train_every=50,
+                 n_grad_epochs=3,
+                 batch_size=32,
+                 hidden_nodes=8,
+                 learning_rate=1e-3,
+                 # Conservative Neural-PLO integration (inspired by NDGPLO_BSA)
+                 neural_blend_factor=0.3,  # Conservative blending factor (like NDGPLO_BSA)
+                 adaptive_integration=True,  # Progressive integration over time
+                 **kwargs):
+
+        # Initialize parent OriginalPLO
+        super().__init__(epoch, pop_size, **kwargs)
+
+        # Neural network parameters
+        self.prediction_usage_probability = prediction_usage_probability
+        self.min_data_for_training = min_data_for_training
+        self.train_every = train_every
+        self.n_grad_epochs = n_grad_epochs
+        self.batch_size = batch_size
+        self.hidden_nodes = hidden_nodes
+        self.learning_rate = learning_rate
+
+        # Conservative Neural-PLO integration parameters (inspired by NDGPLO_BSA)
+        self.neural_blend_factor = neural_blend_factor
+        self.adaptive_integration = adaptive_integration
+
+        # Neural network components
+        self.dirnet = None
+        self.optimizer = None
+        self.criterion = nn.MSELoss()
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model_trained = False
+
+        # Data management for neural network training
+        self.data = []
+
+        # Training optimization parameters
+        self.early_stopping_patience = 3
+        self.min_loss_improvement = 1e-5
+        self.global_step_counter = 0
+
+    def _collect_direction_data(self, agent_x, agent_y, minmax: str = "min"):
+        """
+        Collect direction data for neural network training from PLO operations.
+        """
+        # Determine which agent is better based on minmax
+        if minmax == "min":
+            if agent_x.target.fitness < agent_y.target.fitness:
+                better_agent = agent_x
+                worse_agent = agent_y
+            else:
+                better_agent = agent_y
+                worse_agent = agent_x
+        else:  # maxmax == "max"
+            if agent_x.target.fitness > agent_y.target.fitness:
+                better_agent = agent_x
+                worse_agent = agent_y
+            else:
+                better_agent = agent_y
+                worse_agent = agent_x
+
+        # Collect direction data: from worse position toward better position
+        direction = better_agent.solution - worse_agent.solution
+        if np.linalg.norm(direction) > 1e-12:  # Only collect meaningful directions
+            self.data.append({
+                'start_pos': worse_agent.solution.copy(),
+                'direction': direction.copy()
+            })
+
+        return better_agent.copy()
+
+    def _predict_direction(self, current_position):
+        """
+        Use the trained neural network to predict a direction from the current position.
+        """
+        if not self.model_trained or self.dirnet is None:
+            return None
+
+        try:
+            self.dirnet.eval()
+            with torch.no_grad():
+                # Normalize input using position bounds
+                pos_tensor = torch.tensor(current_position, dtype=torch.float32).to(self.device)
+                pos_scale = ((torch.tensor(self.problem.ub, dtype=torch.float32) -
+                            torch.tensor(self.problem.lb, dtype=torch.float32)) / 2.0).to(self.device)
+                pos_shift = ((torch.tensor(self.problem.ub, dtype=torch.float32) +
+                            torch.tensor(self.problem.lb, dtype=torch.float32)) / 2.0).to(self.device)
+                norm_input = (pos_tensor - pos_shift) / pos_scale
+
+                # Get prediction
+                predicted_direction = self.dirnet(norm_input.unsqueeze(0)).squeeze(0)
+                return predicted_direction.cpu().numpy()
+
+        except Exception as e:
+            if self.logger:
+                self.logger.warning(f"Direction prediction error: {e}")
+            return None
+
+    def _train_neural_network(self, epoch):
+        """
+        Train the neural network with collected direction data from PLO operations.
+        """
+        if len(self.data) < self.min_data_for_training:
+            return
+
+        try:
+            # Create train/validation split
+            train_size = int(0.8 * len(self.data))
+            indices = np.arange(len(self.data))
+            np.random.shuffle(indices)
+
+            train_data = [self.data[i] for i in indices[:train_size]]
+            val_data = [self.data[i] for i in indices[train_size:]]
+
+            # Create datasets and data loaders
+            train_dataset = CustomDataset(train_data, self.problem.lb, self.problem.ub)
+            dir_stats = train_dataset.get_direction_stats()
+            val_dataset = CustomDataset(val_data, self.problem.lb, self.problem.ub, pos_stats=dir_stats)
+
+            train_loader = DataLoader(train_dataset, batch_size=self.batch_size,
+                                    shuffle=True, drop_last=False)
+            val_loader = DataLoader(val_dataset, batch_size=self.batch_size,
+                                  shuffle=False, drop_last=False)
+
+            # Initialize network if needed
+            if self.dirnet is None:
+                self.dirnet = DirNet(self.problem.n_dims, self.hidden_nodes,
+                                   self.problem.n_dims).to(self.device)
+
+            # Setup optimizer
+            self.optimizer = optim.Adam(self.dirnet.parameters(), lr=self.learning_rate)
+
+            # Training loop with early stopping
+            best_val_loss = float('inf')
+            patience_counter = 0
+
+            for e in range(self.n_grad_epochs):
+                # Training phase
+                self.dirnet.train()
+                train_loss_total = 0.0
+                train_batches = 0
+
+                for batch_x, batch_y in train_loader:
+                    batch_x, batch_y = batch_x.to(self.device), batch_y.to(self.device)
+
+                    # Forward pass
+                    predictions = self.dirnet(batch_x)
+                    loss = self.criterion(predictions, batch_y)
+
+                    # Backward pass
+                    self.optimizer.zero_grad()
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.dirnet.parameters(), 1.0)
+                    self.optimizer.step()
+
+                    train_loss_total += loss.item()
+                    train_batches += 1
+
+                # Validation phase
+                self.dirnet.eval()
+                val_loss_total = 0.0
+                val_batches = 0
+
+                with torch.no_grad():
+                    for batch_x, batch_y in val_loader:
+                        batch_x, batch_y = batch_x.to(self.device), batch_y.to(self.device)
+                        predictions = self.dirnet(batch_x)
+                        loss = self.criterion(predictions, batch_y)
+                        val_loss_total += loss.item()
+                        val_batches += 1
+
+                # Calculate average losses
+                avg_val_loss = val_loss_total / val_batches if val_batches > 0 else 0
+
+                # Early stopping check
+                if avg_val_loss < best_val_loss - self.min_loss_improvement:
+                    best_val_loss = avg_val_loss
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+                    if patience_counter >= self.early_stopping_patience:
+                        break
+
+                self.global_step_counter += 1
+
+            # Mark model as trained
+            self.model_trained = True
+
+        except Exception as e:
+            print(f"Error during neural network training: {e}")
+            if self.logger:
+                self.logger.error(f"Neural network training failed: {e}")
+
+    def _conservative_neural_enhancement(self, current_solution, plo_movement, predicted_direction, progress_ratio):
+        """
+        Conservative Neural Enhancement: Simple blending inspired by NDGPLO_BSA success.
+
+        Uses the same successful pattern as NDGPLO_BSA:
+        - Progressive neural influence starting from 0%
+        - Simple direction blending without complex scaling
+        - Robust fallback to pure PLO
+        """
+        if predicted_direction is None:
+            # Fallback to pure PLO movement
+            return plo_movement
+
+        # Conservative adaptive blending (like NDGPLO_BSA)
+        if self.adaptive_integration:
+            # Start with 0% neural influence, gradually increase
+            blend_factor = self.neural_blend_factor * progress_ratio
+        else:
+            # Fixed conservative blending
+            blend_factor = self.neural_blend_factor
+
+        # Ensure conservative blending (max 80% neural influence like NDGPLO_BSA)
+        blend_factor = np.clip(blend_factor, 0.0, 0.8)
+
+        # Simple direction blending (NDGPLO_BSA pattern)
+        # PLO direction: plo_movement - current_solution
+        plo_direction = plo_movement - current_solution
+
+        # Combine directions with conservative weighting
+        combined_direction = ((1 - blend_factor) * plo_direction +
+                            blend_factor * predicted_direction)
+
+        # Generate enhanced movement
+        enhanced_movement = current_solution + combined_direction
+
+        return enhanced_movement
+
+    def _apply_ndgplo_bsa_operator(self, current_agent, epoch, agent_idx):
+        """
+        Apply NDGPLO_BSA operator to a single agent.
+        Uses BSA's proven mathematical formula with neural enhancement.
+        """
+        progress_ratio = epoch / self.epoch
+
+        # Initialize historical population if not done
+        if not hasattr(self, 'historical_population') or len(self.historical_population) == 0:
+            self.historical_population = [agent.copy() for agent in self.pop]
+
+        # Ensure historical population has enough agents
+        if len(self.historical_population) <= agent_idx:
+            self.historical_population.extend([agent.copy() for agent in self.pop])
+
+        # BSA mutation components
+        random_indices = self.generator.choice(len(self.pop), size=2, replace=False)
+        P1 = self.pop[random_indices[0]].solution
+        P2 = self.pop[random_indices[1]].solution
+        oldP = self.historical_population[agent_idx].solution
+
+        # Calculate F factor - BSA standard range
+        F = 3 * self.generator.random()  # BSA standard: F ∈ [0, 3]
+
+        # BSA's PROVEN FORMULA: Mutant = oldP + F * (P1 - P2)
+        # bsa_mutant = oldP + F * (P1 - P2)
+
+        # Neural enhancement: Try to get predicted direction
+        use_neural_guidance = (self.model_trained and
+                             self.dirnet is not None and
+                             self.generator.random() < self.prediction_usage_probability)
+
+        if True or use_neural_guidance:
+            predicted_direction = self._predict_direction(current_agent.solution)
+
+            # bsa_mutant = oldP + F * (P1 - P2)
+            bsa_mutant = oldP + F * predicted_direction
+
+            if True or predicted_direction is not None:
                 # Apply conservative neural enhancement (NDGPLO_BSA pattern)
                 enhanced_solution = self._conservative_neural_enhancement(
                     current_agent.solution, bsa_mutant, predicted_direction, progress_ratio)
