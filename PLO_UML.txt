@@ -1,0 +1,319 @@
+@startuml
+class OriginalPLO {
+    levy()
+    evolve()
+        epoch
+    pop_size
+    sort_flag
+    pop
+    __init__()
+}
+class KlmNet {
+    forward()
+        n_dims
+    fc1
+    act1
+    fc2
+    act2
+    fc3
+    __init__()
+}
+class KLEPLO {
+    _initialize_klm_net()
+    _collect_klm_experience()
+    _train_klm_net()
+    _apply_klm_guidance()
+    evolve()
+        device
+    klm_usage_probability
+    klm_training_freq
+    klm_lr
+    klm_warmup_epochs
+    klm_max_experiences
+    klm_experience_batch_size
+    klm_step_scale
+    klm_epoch_per_update
+    klm_net
+    klm_optimizer
+    klm_criterion
+    klm_experience_buffer
+    klm_initialized
+    klm_usage_count
+    klm_net
+    klm_optimizer
+    klm_initialized
+    klm_initialized
+    __init__()
+}
+class DirNet {
+    forward()
+        net
+    __init__()
+}
+class CustomDataset {
+    __len__()
+    __getitem__()
+    get_direction_stats()
+    denormalize_direction()
+        data_list
+    lb
+    ub
+    dir_mean
+    dir_std
+    dir_mean
+    dir_std
+    __init__()
+}
+class DirPLO {
+    cosine_loss()
+    mse_loss()
+    combined_loss()
+    _calculate_population_diversity()
+    _get_adaptive_f_factor()
+    _apply_de_style_magnitude()
+    _apply_pso_style_magnitude()
+    _apply_abc_style_magnitude()
+    _apply_crossover()
+    _apply_enhanced_magnitude_adjustment()
+    _collect_direction_data()
+    _predict_direction()
+    evolve()
+    _train_neural_network()
+        prediction_usage_probability
+    min_data_for_training
+    train_every
+    n_grad_epochs
+    batch_size
+    hidden_nodes
+    learning_rate
+    magnitude_strategy
+    base_f_factor
+    f_factor_range
+    crossover_rate
+    use_population_guidance
+    diversity_threshold
+    dirnet
+    optimizer
+    criterion
+    device
+    model_trained
+    train_loader
+    val_loader
+    noise_std
+    global_step_counter
+    early_stopping_patience
+    min_loss_improvement
+    last_training_loss
+    no_improvement_count
+    base_magnitude
+    base_magnitude
+    data
+    dirnet
+    optimizer
+    model_trained
+    __init__()
+}
+class NDGPLO {
+    _cosine_loss()
+    _mse_loss()
+    _combined_loss()
+    _calculate_population_diversity()
+    _get_adaptive_f_factor()
+    _apply_adaptive_de_crossover_operator()
+    _apply_pso_guided_mutation_operator()
+    _apply_bsa_inspired_operator()
+    _update_historical_population()
+    _apply_crossover()
+    _update_operator_success_rate()
+    _select_operator_adaptively()
+    _apply_advanced_research_operators()
+    _collect_direction_data()
+    _predict_direction()
+    _train_neural_network()
+    evolve()
+        prediction_usage_probability
+    min_data_for_training
+    train_every
+    n_grad_epochs
+    batch_size
+    hidden_nodes
+    learning_rate
+    operator_strategy
+    base_f_factor
+    f_factor_range
+    crossover_rate
+    diversity_threshold
+    last_operator_used
+    max_historical_size
+    dirnet
+    optimizer
+    criterion
+    device
+    model_trained
+    train_loader
+    val_loader
+    noise_std
+    global_step_counter
+    early_stopping_patience
+    min_loss_improvement
+    last_training_loss
+    no_improvement_count
+    last_operator_used
+    last_operator_used
+    dirnet
+    optimizer
+    model_trained
+    data
+    __init__()
+}
+class SimpleBSANDGPLO {
+    _mse_loss()
+    _cosine_loss()
+    _combined_loss()
+    _apply_pure_bsa_algorithm()
+    _update_historical_population()
+    _collect_direction_data()
+    _predict_direction()
+    _train_neural_network()
+    evolve()
+        prediction_usage_probability
+    min_data_for_training
+    train_every
+    n_grad_epochs
+    batch_size
+    hidden_nodes
+    learning_rate
+    base_f_factor
+    dirnet
+    optimizer
+    criterion
+    device
+    model_trained
+    train_loader
+    val_loader
+    max_historical_size
+    historical_initialized
+    early_stopping_patience
+    min_loss_improvement
+    global_step_counter
+    pop
+    g_best
+    historical_initialized
+    dirnet
+    optimizer
+    model_trained
+    __init__()
+}
+class NDGPLO_BSA {
+    _collect_direction_data()
+    _predict_direction()
+    _train_neural_network()
+    _apply_neural_guided_bsa_algorithm()
+    _enhanced_bsa_mutation()
+    _neural_guided_crossover_mapping()
+    _standard_bsa_crossover_mapping()
+    evolve()
+        prediction_usage_probability
+    min_data_for_training
+    train_every
+    n_grad_epochs
+    batch_size
+    hidden_nodes
+    learning_rate
+    neural_blend_factor
+    dimension_priority_threshold
+    adaptive_integration
+    dirnet
+    optimizer
+    criterion
+    device
+    model_trained
+    early_stopping_patience
+    min_loss_improvement
+    global_step_counter
+    dirnet
+    optimizer
+    model_trained
+    pop
+    g_best
+    data
+    __init__()
+}
+class NDGPLO {
+    _collect_direction_data()
+    _predict_direction()
+    _train_neural_network()
+    _conservative_neural_enhancement()
+    _apply_ndgplo_bsa_operator()
+    _apply_original_plo_operator()
+    _apply_hybrid_ndgplo_algorithm()
+    evolve()
+        prediction_usage_probability
+    min_data_for_training
+    train_every
+    n_grad_epochs
+    batch_size
+    hidden_nodes
+    learning_rate
+    neural_blend_factor
+    adaptive_integration
+    dirnet
+    optimizer
+    criterion
+    device
+    model_trained
+    early_stopping_patience
+    min_loss_improvement
+    global_step_counter
+    dirnet
+    optimizer
+    model_trained
+    pop
+    g_best
+    data
+    __init__()
+}
+class NDGPLO2 {
+    _collect_direction_data()
+    _predict_direction()
+    _train_neural_network()
+    _conservative_neural_enhancement()
+    _apply_ndgplo_bsa_operator()
+    _apply_original_plo_operator()
+    _apply_hybrid_ndgplo_algorithm()
+    evolve()
+        prediction_usage_probability
+    min_data_for_training
+    train_every
+    n_grad_epochs
+    batch_size
+    hidden_nodes
+    learning_rate
+    neural_blend_factor
+    adaptive_integration
+    dirnet
+    optimizer
+    criterion
+    device
+    model_trained
+    early_stopping_patience
+    min_loss_improvement
+    global_step_counter
+    dirnet
+    optimizer
+    model_trained
+    pop
+    g_best
+    data
+    __init__()
+}
+Optimizer <|-- OriginalPLO
+OriginalPLO <|-- KLEPLO
+Dataset <|-- CustomDataset
+OriginalPLO <|-- DirPLO
+OriginalPLO <|-- NDGPLO
+OriginalPLO <|-- SimpleBSANDGPLO
+SimpleBSANDGPLO <|-- NDGPLO_BSA
+OriginalPLO <|-- NDGPLO
+OriginalPLO <|-- NDGPLO2
+@enduml
