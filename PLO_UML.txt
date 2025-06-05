@@ -53,16 +53,14 @@ class DirNet {
 class CustomDataset {
     __len__()
     __getitem__()
-    get_direction_stats()
-    denormalize_direction()
         data_list
     lb
     ub
-    dir_mean
-    dir_std
-    dir_mean
-    dir_std
     __init__()
+}
+class CosineLoss {
+    forward()
+        __init__()
 }
 class DirPLO {
     cosine_loss()
@@ -244,6 +242,7 @@ class NDGPLO {
     _predict_direction()
     _train_neural_network()
     _conservative_neural_enhancement()
+    _get_adaptive_step()
     _apply_ndgplo_bsa_operator()
     _apply_original_plo_operator()
     _apply_hybrid_ndgplo_algorithm()

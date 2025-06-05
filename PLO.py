@@ -6,8 +6,8 @@ from optimizer import Optimizer
 import torch
 import torch.nn as nn
 import torch.optim as optim
-
 from torch.utils.data import Dataset, DataLoader
+import torch.nn.functional as F
 
 # Optional TensorBoard import
 try:
@@ -335,51 +335,54 @@ class DirNet(nn.Module):
 
 class CustomDataset(Dataset):
 
-    def __init__(self, data, lb, ub, pos_stats=None):
+    def __init__(self, data, lb, ub):
         self.data_list = data
         self.lb = torch.tensor(lb, dtype=torch.float32)
         self.ub = torch.tensor(ub, dtype=torch.float32)
 
-        # Position normalization parameters (for features)
-        self.pos_scale = ((self.ub - self.lb) / 2.0).clone().detach().to(dtype=torch.float32)
-        self.pos_shift = ((self.ub + self.lb) / 2.0).clone().detach().to(dtype=torch.float32)
+        # Position normalization parameters
+        self.pos_scale = ((self.ub - self.lb) / 2.0).clone().detach()
+        self.pos_shift = ((self.ub + self.lb) / 2.0).clone().detach()
 
-        # Direction normalization parameters (for labels)
-        if pos_stats is None:
-            # Calculate direction statistics from the data
-            directions = [torch.tensor(item['direction'], dtype=torch.float32) for item in data]
-            if directions:
-                directions_tensor = torch.stack(directions)
-                self.dir_mean = directions_tensor.mean(dim=0)
-                self.dir_std = directions_tensor.std(dim=0) + 1e-8  # Add small epsilon
-            else:
-                self.dir_mean = torch.zeros_like(self.pos_shift)
-                self.dir_std = torch.ones_like(self.pos_scale)
-        else:
-            self.dir_mean, self.dir_std = pos_stats
+        # Preprocess all samples once during initialization
+        self.processed_samples = []
+        for item in data:
+            # Normalize position
+            feature = torch.tensor(item['start_pos'], dtype=torch.float32)
+            norm_feature = (feature - self.pos_shift) / self.pos_scale
+            
+            # Convert direction to unit vector
+            direction = torch.tensor(item['direction'], dtype=torch.float32)
+            norm = torch.norm(direction)
+            unit_direction = direction / torch.clamp(norm, min=1e-8)
+            
+            self.processed_samples.append({
+                'feature': norm_feature,
+                'direction': unit_direction
+            })
 
     def __len__(self):
-        return len(self.data_list)
+        return len(self.processed_samples)
 
     def __getitem__(self, idx):
-        feature = torch.tensor(self.data_list[idx]['start_pos'], dtype=torch.float32)
-        label = torch.tensor(self.data_list[idx]['direction'], dtype=torch.float32)
+        # Simply return preprocessed data
+        sample = self.processed_samples[idx]
+        return sample['feature'], sample['direction']
 
-        # Normalize position (feature) using position bounds
-        norm_feature = (feature - self.pos_shift) / self.pos_scale
 
-        # Normalize direction (label) using direction statistics
-        norm_label = (label - self.dir_mean) / self.dir_std
-
-        return norm_feature, norm_label
-
-    def get_direction_stats(self):
-        """Return direction normalization statistics"""
-        return self.dir_mean, self.dir_std
-
-    def denormalize_direction(self, norm_direction):
-        """Denormalize a direction vector"""
-        return norm_direction * self.dir_std + self.dir_mean
+class CosineLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        
+    def forward(self, pred, target):
+        """
+        Args:
+            pred: predicted directions (batch_size, dim)
+            target: ground truth unit vectors (batch_size, dim)
+        Returns:
+            loss: scalar
+        """
+        return 1 - F.cosine_similarity(pred, target, dim=1).mean()
 
     
 class DirPLO(OriginalPLO):
@@ -834,8 +837,7 @@ class DirPLO(OriginalPLO):
 
             # Step 4: Create datasets and data loaders
             train_dataset = CustomDataset(train_data, self.problem.lb, self.problem.ub)
-            dir_stats = train_dataset.get_direction_stats()
-            val_dataset = CustomDataset(val_data, self.problem.lb, self.problem.ub, pos_stats=dir_stats)
+            val_dataset = CustomDataset(val_data, self.problem.lb, self.problem.ub)
 
             train_loader = DataLoader(train_dataset, batch_size=self.batch_size,
                                     shuffle=True, drop_last=False)
@@ -1407,8 +1409,7 @@ class NDGPLO(OriginalPLO):
 
             # Step 4: Create datasets and data loaders
             train_dataset = CustomDataset(train_data, self.problem.lb, self.problem.ub)
-            dir_stats = train_dataset.get_direction_stats()
-            val_dataset = CustomDataset(val_data, self.problem.lb, self.problem.ub, pos_stats=dir_stats)
+            val_dataset = CustomDataset(val_data, self.problem.lb, self.problem.ub)
 
             train_loader = DataLoader(train_dataset, batch_size=self.batch_size,
                                     shuffle=True, drop_last=False)
@@ -1882,8 +1883,7 @@ class SimpleBSANDGPLO(OriginalPLO):
 
             # Create datasets and data loaders
             train_dataset = CustomDataset(train_data, self.problem.lb, self.problem.ub)
-            dir_stats = train_dataset.get_direction_stats()
-            val_dataset = CustomDataset(val_data, self.problem.lb, self.problem.ub, pos_stats=dir_stats)
+            val_dataset = CustomDataset(val_data, self.problem.lb, self.problem.ub)
 
             train_loader = DataLoader(train_dataset, batch_size=self.batch_size,
                                     shuffle=True, drop_last=False)
@@ -2118,8 +2118,7 @@ class NDGPLO_BSA(SimpleBSANDGPLO):
 
             # Create datasets and data loaders
             train_dataset = CustomDataset(train_data, self.problem.lb, self.problem.ub)
-            dir_stats = train_dataset.get_direction_stats()
-            val_dataset = CustomDataset(val_data, self.problem.lb, self.problem.ub, pos_stats=dir_stats)
+            val_dataset = CustomDataset(val_data, self.problem.lb, self.problem.ub)
 
             train_loader = DataLoader(train_dataset, batch_size=self.batch_size,
                                     shuffle=True, drop_last=False)
@@ -2482,7 +2481,7 @@ class NDGPLO(OriginalPLO):
                  hidden_nodes=8,
                  learning_rate=1e-3,
                  # Conservative Neural-PLO integration (inspired by NDGPLO_BSA)
-                 neural_blend_factor=0.3,  # Conservative blending factor (like NDGPLO_BSA)
+                 neural_blend_factor=0.5,  # Conservative blending factor (like NDGPLO_BSA)
                  adaptive_integration=True,  # Progressive integration over time
                  **kwargs):
 
@@ -2505,7 +2504,7 @@ class NDGPLO(OriginalPLO):
         # Neural network components
         self.dirnet = None
         self.optimizer = None
-        self.criterion = nn.MSELoss()
+        self.criterion = CosineLoss()
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model_trained = False
 
@@ -2549,7 +2548,8 @@ class NDGPLO(OriginalPLO):
 
     def _predict_direction(self, current_position):
         """
-        Use the trained neural network to predict a direction from the current position.
+        Predicts a unit vector direction from current position.
+        Returns a direction vector that should be scaled as needed.
         """
         if not self.model_trained or self.dirnet is None:
             return None
@@ -2557,17 +2557,22 @@ class NDGPLO(OriginalPLO):
         try:
             self.dirnet.eval()
             with torch.no_grad():
-                # Normalize input using position bounds
+                # 1. Normalize input position
                 pos_tensor = torch.tensor(current_position, dtype=torch.float32).to(self.device)
-                pos_scale = ((torch.tensor(self.problem.ub, dtype=torch.float32) -
-                            torch.tensor(self.problem.lb, dtype=torch.float32)) / 2.0).to(self.device)
-                pos_shift = ((torch.tensor(self.problem.ub, dtype=torch.float32) +
-                            torch.tensor(self.problem.lb, dtype=torch.float32)) / 2.0).to(self.device)
+                pos_scale = torch.tensor((self.problem.ub - self.problem.lb) / 2.0, 
+                                    dtype=torch.float32).to(self.device)
+                pos_shift = torch.tensor((self.problem.ub + self.problem.lb) / 2.0, 
+                                    dtype=torch.float32).to(self.device)
                 norm_input = (pos_tensor - pos_shift) / pos_scale
 
-                # Get prediction
-                predicted_direction = self.dirnet(norm_input.unsqueeze(0)).squeeze(0)
-                return predicted_direction.cpu().numpy()
+                # 2. Get raw prediction (already near unit vector due to cosine loss training)
+                predicted = self.dirnet(norm_input.unsqueeze(0)).squeeze(0)
+
+                # 3. Convert to exact unit vector
+                predicted_unit = predicted / torch.norm(predicted).clamp(min=1e-8)
+
+                # 4. Return as numpy array (still a unit vector)
+                return predicted_unit.cpu().numpy()
 
         except Exception as e:
             if self.logger:
@@ -2592,8 +2597,7 @@ class NDGPLO(OriginalPLO):
 
             # Create datasets and data loaders
             train_dataset = CustomDataset(train_data, self.problem.lb, self.problem.ub)
-            dir_stats = train_dataset.get_direction_stats()
-            val_dataset = CustomDataset(val_data, self.problem.lb, self.problem.ub, pos_stats=dir_stats)
+            val_dataset = CustomDataset(val_data, self.problem.lb, self.problem.ub)
 
             train_loader = DataLoader(train_dataset, batch_size=self.batch_size,
                                     shuffle=True, drop_last=False)
@@ -2706,6 +2710,29 @@ class NDGPLO(OriginalPLO):
 
         return enhanced_movement
 
+    def _get_adaptive_step(self, base_step=1):
+        """Calculate adaptive step size with proper shape handling"""
+        
+        # Extract solutions and ensure numpy array
+        solutions = np.array([agent.solution for agent in self.pop])
+        
+        # Ensure best_solution is numpy array and correct shape
+        best_solution = np.array(self.g_best.solution)
+        best_solution = best_solution.flatten()
+        
+        # Calculate statistics
+        mu = np.mean(solutions, axis=0)
+        sigma = np.std(solutions, axis=0)
+        
+        # Now calculate distance safely
+        distance_to_best = np.abs(mu - best_solution)
+        
+        # Calculate adaptive step
+        adaptive_step = base_step * (sigma / (distance_to_best + 1e-8))
+        
+        return adaptive_step
+
+
     def _apply_ndgplo_bsa_operator(self, current_agent, epoch, agent_idx):
         """
         Apply NDGPLO_BSA operator to a single agent.
@@ -2728,21 +2755,22 @@ class NDGPLO(OriginalPLO):
         oldP = self.historical_population[agent_idx].solution
 
         # Calculate F factor - BSA standard range
-        F = 3 * self.generator.random()  # BSA standard: F ∈ [0, 3]
+        # F = 3 * self.generator.random()  # BSA standard: F ∈ [0, 3]
+        F = 3 * np.random.randn()  # BSA standard: F ∈ [0, 3]
 
         # BSA's PROVEN FORMULA: Mutant = oldP + F * (P1 - P2)
         # bsa_mutant = oldP + F * (P1 - P2)
+        predicted_direction = self._predict_direction(current_agent.solution)
+        adaptive_step = self._get_adaptive_step()
+        bsa_mutant = current_agent.solution + predicted_direction * adaptive_step
 
         # Neural enhancement: Try to get predicted direction
         use_neural_guidance = (self.model_trained and
                              self.dirnet is not None and
                              self.generator.random() < self.prediction_usage_probability)
 
-        if use_neural_guidance:
+        if False and use_neural_guidance:
             predicted_direction = self._predict_direction(current_agent.solution)
-
-            # bsa_mutant = oldP + F * (P1 - P2)
-            bsa_mutant = oldP + F * predicted_direction
 
             if False and predicted_direction is not None:
                 # Apply conservative neural enhancement (NDGPLO_BSA pattern)
@@ -3038,8 +3066,7 @@ class NDGPLO2(OriginalPLO):
 
             # Create datasets and data loaders
             train_dataset = CustomDataset(train_data, self.problem.lb, self.problem.ub)
-            dir_stats = train_dataset.get_direction_stats()
-            val_dataset = CustomDataset(val_data, self.problem.lb, self.problem.ub, pos_stats=dir_stats)
+            val_dataset = CustomDataset(val_data, self.problem.lb, self.problem.ub)
 
             train_loader = DataLoader(train_dataset, batch_size=self.batch_size,
                                     shuffle=True, drop_last=False)
